@@ -1,25 +1,23 @@
 """
-API Server untuk React Native Expo App
-Menggantikan fungsi WhatsApp Fonnte dengan REST API langsung ke app.
+API Server untuk React Native Android App
+Chatbot engine diambil langsung dari main_wa.py — tanpa WA/Fonnte.
 
 Endpoint:
-  POST /chat              → chatbot (ganti webhook WA)
-  GET  /reports           → list semua report (daily/weekly/monthly)
-  GET  /reports/<id>      → detail 1 report
-  POST /push/register     → daftar Expo push token user
-  GET  /health            → health check
-
-Strategi:
-  - Chatbot engine diambil dari main_wa.py (langchain + SQLDatabase)
-  - Report disimpan ke tabel `reports` oleh masing-masing agent
-  - Push notif dikirim via Expo Push API (gratis)
+  GET  /health                  → health check
+  POST /chat                    → chatbot (dari Android)
+  GET  /reports                 → list semua report
+  GET  /reports/latest/<type>   → report terbaru by type
+  GET  /reports/<id>            → detail 1 report
+  POST /push/register           → daftar Expo push token
+  POST /push/unregister         → hapus Expo push token
 """
 
-import os, re, threading, requests, psycopg2, psycopg2.extras
+import os, re, requests, psycopg2, psycopg2.extras
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage
 
 load_dotenv()
 
@@ -27,23 +25,20 @@ DATABASE_URL    = os.getenv("DATABASE_URL", "")
 DINOIKI_API_KEY = os.getenv("DINOIKI_API_KEY", "")
 PRISMA_URL      = os.getenv("PRISMA_URL", "")
 CHATBOT_API_KEY = os.getenv("CHATBOT_API_KEY", "")
-APP_SECRET_KEY  = os.getenv("APP_SECRET_KEY", "")   # header auth dari app
+APP_SECRET_KEY  = os.getenv("APP_SECRET_KEY", "")
 PRISMA_HEADERS  = {"x-chatbot-key": CHATBOT_API_KEY}
 
-# ─── DB RAW (untuk reports & push tokens) ────────────────────────────────────
+# ─── DB (psycopg2 untuk reports & push_tokens) ───────────────────────────────
 def get_conn():
     url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     return psycopg2.connect(url, sslmode="require")
 
-def q(sql, params=None, fetch=True):
+def q(sql, params=None):
     try:
         with get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(sql, params or ())
-                if fetch:
-                    return [dict(r) for r in cur.fetchall()]
-                conn.commit()
-                return []
+                return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         print(f"  [DB] {e}")
         return []
@@ -57,12 +52,11 @@ def execute(sql, params=None):
     except Exception as e:
         print(f"  [DB EXEC] {e}")
 
-# ─── INIT TABEL (auto-create jika belum ada) ──────────────────────────────────
 def init_tables():
     execute("""
         CREATE TABLE IF NOT EXISTS reports (
             id         SERIAL PRIMARY KEY,
-            type       VARCHAR(10) NOT NULL,  -- 'daily' / 'weekly' / 'monthly'
+            type       VARCHAR(10) NOT NULL,
             content    TEXT        NOT NULL,
             created_at TIMESTAMP   DEFAULT NOW()
         )
@@ -76,18 +70,9 @@ def init_tables():
             updated_at TIMESTAMP    DEFAULT NOW()
         )
     """)
-    execute("""
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id         SERIAL PRIMARY KEY,
-            user_id    VARCHAR(100) NOT NULL,
-            role       VARCHAR(20)  NOT NULL,  -- 'user' / 'assistant'
-            content    TEXT         NOT NULL,
-            created_at TIMESTAMP    DEFAULT NOW()
-        )
-    """)
-    print("[DB] Tabel reports, push_tokens, chat_history siap.")
+    print("[DB] Tabel reports & push_tokens siap.")
 
-# ─── LLM & DB ENGINE ──────────────────────────────────────────────────────────
+# ─── LLM & DB ENGINE (langchain) ─────────────────────────────────────────────
 db_engine = SQLDatabase.from_uri(
     DATABASE_URL.replace("postgres://", "postgresql://", 1),
     sample_rows_in_table_info=0
@@ -136,7 +121,7 @@ def build_prisma_schema_prompt(schema: dict) -> str:
         "ATURAN QUERY PRISMA:",
         '- Kolom "order" WAJIB ditulis dengan tanda kutip ganda: "order"',
         "- Selalu gunakan LIMIT maksimal 50",
-        "- JANGAN query tabel PRISMA ke database lokal — gunakan query_prisma(sql)",
+        "- JANGAN query tabel PRISMA ke database lokal",
     ]
     return "\n".join(lines)
 
@@ -161,22 +146,19 @@ PRISMA_TABLES        = set(PRISMA_SCHEMA.get("allowed_tables", [
     "sap_pr", "sap_po", "work_order"
 ]))
 
-# ─── SYSTEM PROMPT (sama dengan main_wa.py) ───────────────────────────────────
-CUSTOM_PROMPT = f"""You are a PostgreSQL expert and a helpful AI Assistant for a refinery company.
+# ─── SYSTEM PROMPT (dari main_wa.py, format mobile — tanpa format WA) ────────
+CUSTOM_PROMPT = """You are a PostgreSQL expert and a helpful AI Assistant for a refinery company.
 Given an input question, create a syntactically correct PostgreSQL query to run.
 HANYA BERIKAN QUERY SQL MURNI, TANPA MARKDOWN ATAU BACKTICK.
 
 Setelah mendapatkan hasil dari database, berikan jawaban akhir dalam Bahasa Indonesia yang profesional.
-Format jawaban untuk mobile app: gunakan teks bersih, boleh gunakan emoji, hindari tabel HTML.
 
 STRUKTUR TABEL TERSEDIA:
-{{table_info}}
-
-{PRISMA_SCHEMA_PROMPT}
+{table_info}
 
 ATURAN QUERY SQL:
-- Pilih tabel yang paling relevan berdasarkan nama tabel dan kolom.
-- Jika tabel relevan kosong, jawab: "Data belum tersedia."
+- Pilih tabel yang paling relevan berdasarkan nama tabel dan kolom yang tersedia.
+- Jika tabel relevan kosong, jawab: "Data belum tersedia, silakan upload datanya terlebih dahulu."
 - Kolom RU antar tabel mungkin berbeda format, gunakan ILIKE '%RU II%' saat JOIN.
 - Selalu gunakan NULLIF(kolom_penyebut, 0) untuk menghindari division by zero.
 - Gunakan ROUND(nilai::numeric, 2) untuk pembulatan.
@@ -184,76 +166,200 @@ ATURAN QUERY SQL:
 - Untuk pertanyaan "tampilkan semua / dump data" → tolak dengan sopan.
 - Untuk pertanyaan di luar konteks kilang → jawab: "Maaf, saya hanya membantu analisis data maintenance kilang."
 - Sapaan, terima kasih → balas dengan ramah tanpa query SQL.
-"""
+- Untuk icu_monitoring: kolom utama adalah ru, icu_status, tag_no, issue, mitigation, progress, target_closed, report_date.
+- Untuk paf: Plant Availability Factor — kolom type, ru, target_realisasi, value, plan_unplan, month.
+- Untuk zero_clamp: kolom ru, area, unit, tag_no_ln, type_damage, status, tanggal_dipasang.
+- Untuk power_stream: kolom refinery_unit, type_equipment, equipment, status_operation, desain, kapasitas_max, average_actual.
+- Untuk readiness_jetty: kolom refinery_unit, tag_no, status_operation, status_tuks, status_ijin_ops, status_isps, month_update.
+- Untuk readiness_tank: kolom refinery_unit, tag_number, status_operational, status_coi, status_atg, month_update.
+- Untuk readiness_spm: kolom refinery_unit, tag_no, status_operation, status_laik_operasi, status_ijin_spl, month_update.
+- Untuk atg_monitoring: kolom refinery_unit, tag_no_tangki, tag_no_atg, status_atg, status_interkoneksi_atg, month_update.
+- Untuk bad_actor_monitoring: kolom ru, tag_number, status, problem, action_plan, progress, target_date, periode.
+- Untuk pipeline_inspection: kolom refinery_unit, tag_number, fluida_service, rem_life_years, jumlah_temporary_repair, bulan, tahun.
+- Untuk monitoring_operasi: kolom refinery_unit, unit_proses, actual, target_sts, limitasi_alert_process, month_update.
+- Untuk anggaran_maintenance: kolom ru, tahun, kategori, tipe, nilai_usd. Tampilkan dengan format USD.
+- Untuk tkdn: kolom refinery_unit, bulan, nominal, kdn, persentase, tahun. Tampilkan dengan format Rp.
+- Untuk rcps: kolom kilang, traffic, judul_rcps, rcps_no, criticallity.
+- Untuk irkap_program: kolom refinery_unit, no_program_kerja, program_kerja, status_step, status_prognosa, nilai_anggaran_idr.
 
-# ─── CHAT HISTORY ─────────────────────────────────────────────────────────────
+{prisma_schema}
+
+ATURAN FORMAT JAWABAN (MOBILE APP):
+1. Jawaban narasi yang jelas dan mudah dibaca di layar HP.
+2. Gunakan poin-poin dengan tanda • jika data lebih dari satu.
+3. Tebalkan poin penting dengan *teks*.
+4. Tambahkan emoji relevan (🏭, 💰, 📊, ✅, ⚠️, 🔧, 🛢️, 🚨, 🔴).
+5. Gunakan angka dengan format mudah dibaca (1.234.567 atau Rp 1,2 M).
+6. Maksimal 10 item — jika lebih, tampilkan highlight saja.
+
+Question: {input}"""
+
+# ─── CHAT HISTORY (in-memory per user_id) ────────────────────────────────────
 MAX_HISTORY = 10
+chat_histories: dict[str, list] = {}
 
 def get_history(user_id: str) -> list:
-    rows = q("""
-        SELECT role, content FROM chat_history
-        WHERE user_id = %s
-        ORDER BY created_at DESC
-        LIMIT %s
-    """, (user_id, MAX_HISTORY * 2))
-    # Balik urutan supaya chronological
-    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    return chat_histories.get(user_id, [])
 
 def add_history(user_id: str, question: str, answer: str):
-    execute("INSERT INTO chat_history (user_id, role, content) VALUES (%s, %s, %s)",
-            (user_id, "user", question))
-    execute("INSERT INTO chat_history (user_id, role, content) VALUES (%s, %s, %s)",
-            (user_id, "assistant", answer))
+    history = chat_histories.get(user_id, [])
+    history.append(HumanMessage(content=question))
+    history.append(AIMessage(content=answer))
+    if len(history) > MAX_HISTORY:
+        history = history[-MAX_HISTORY:]
+    chat_histories[user_id] = history
 
 def clear_history(user_id: str):
-    execute("DELETE FROM chat_history WHERE user_id = %s", (user_id,))
+    chat_histories.pop(user_id, None)
 
-# ─── CHATBOT ENGINE ───────────────────────────────────────────────────────────
+# ─── CHATBOT ENGINE (dari main_wa.py, tanpa WA) ───────────────────────────────
 def run_chat(question: str, user_id: str) -> str:
-    table_info = db_engine.get_table_info()
-    system     = CUSTOM_PROMPT.replace("{table_info}", table_info)
     history    = get_history(user_id)
+    table_info = db_engine.get_table_info()
 
-    messages = [{"role": "system", "content": system}]
-    for h in history:
-        messages.append({"role": h["role"], "content": h["content"]})
+    prisma_prompt = PRISMA_SCHEMA_PROMPT or "(PRISMA schema belum tersedia)"
+    _prompt = (CUSTOM_PROMPT
+        .replace("{table_info}", table_info)
+        .replace("{prisma_schema}", prisma_prompt)
+        .replace("{input}", "")
+        .replace("{{", "{").replace("}}", "}")
+    )
 
-    # Routing: PRISMA atau local DB
-    needs_prisma = any(t in question.lower() for t in [t.lower() for t in PRISMA_TABLES])
-    prisma_keywords = ["reservasi", "ta-ex", "taex", "material ta", "sap pr", "sap po",
-                       "work order", "turnaround", "procurement"]
-    if needs_prisma or any(k in question.lower() for k in prisma_keywords):
-        sql_messages = messages + [{"role": "user", "content": (
-            f"Buat query SQL PostgreSQL untuk tabel PRISMA TA-ex.\n"
-            f"Gunakan HANYA tabel yang disebutkan dalam daftar PRISMA.\n"
-            f"HANYA output SQL, tanpa penjelasan.\n\nPertanyaan: {question}"
-        )}]
-        sql_response = llm.invoke(sql_messages)
-        sql_query    = sql_response.content.replace("```sql","").replace("```","").strip()
-        prisma_result = query_prisma(sql_query)
-        if prisma_result.get("ok"):
-            db_result = f"Hasil dari PRISMA TA-ex ({prisma_result.get('rows',0)} baris):\n{prisma_result.get('data',[])}"
-        else:
-            db_result = f"Query PRISMA gagal: {prisma_result.get('error','Unknown error')}"
+    messages = [{"role": "system", "content": _prompt}]
+    for msg in history:
+        if isinstance(msg, HumanMessage):
+            messages.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            messages.append({"role": "assistant", "content": msg.content})
+
+    # ── Intent detection ──
+    _q_lower = question.lower()
+    _SPESIFIK_KEYWORDS = [
+        "pipeline", "atg", "metering", "rotor", "icu", "bad actor", "paf",
+        "zero clamp", "power stream", "anggaran", "tkdn", "rcps", "boc",
+        "readiness jetty", "readiness tank", "readiness spm",
+        "workplan jetty", "workplan tank", "spm workplan",
+        "inspection plan", "monitoring operasi", "irkap", "prokja",
+        "reservasi", "turnaround", "inspeksi", "realisasi",
+        "bandingkan", "program kerja", "anggaran maintenance",
+    ]
+    _SAPAAN_KEYWORDS = [
+        "halo", "hai", "hello", "hi ", "selamat pagi", "selamat siang",
+        "selamat sore", "selamat malam", "terima kasih", "makasih", "thanks",
+        "apa yang bisa", "kamu bisa apa", "kemampuan", "siapa kamu",
+    ]
+
+    if any(kw in _q_lower for kw in _SAPAAN_KEYWORDS) and not any(kw in _q_lower for kw in _SPESIFIK_KEYWORDS):
+        intent = "SAPAAN"
+    elif any(kw in _q_lower for kw in _SPESIFIK_KEYWORDS):
+        intent = "SPESIFIK"
     else:
+        history_context = ""
+        if history:
+            last_msgs = history[-4:]
+            history_context = "\n".join([
+                f"{'User' if isinstance(m, HumanMessage) else 'Bot'}: {m.content[:200]}"
+                for m in last_msgs
+            ])
+        intent_check = llm.invoke([{
+            "role": "user",
+            "content": (
+                f"Konteks percakapan sebelumnya:\n{history_context}\n\n"
+                f"Klasifikasikan pertanyaan berikut:\n"
+                f"1. SAPAAN — sapaan, terima kasih, tanya kemampuan AI\n"
+                f"2. SPESIFIK — menyebut nama tabel/data kilang secara eksplisit\n"
+                f"3. AMBIGU — tidak menyebut nama tabel spesifik\n"
+                f"Jawab hanya satu kata: SAPAAN, SPESIFIK, atau AMBIGU\n\nPertanyaan: {question}"
+            )
+        }])
+        intent = intent_check.content.strip().upper()
+
+    if "SAPAAN" in intent:
+        resp = llm.invoke(messages + [{"role": "user", "content": question}])
+        return resp.content
+
+    if "AMBIGU" in intent:
+        history_context = ""
+        if history:
+            history_context = "\n".join([
+                f"{'User' if isinstance(m, HumanMessage) else 'Bot'}: {m.content[:200]}"
+                for m in history[-4:]
+            ])
+        clarify = llm.invoke([{
+            "role": "user",
+            "content": (
+                f"Riwayat:\n{history_context}\n\n"
+                f"Pertanyaan: {question}\n\n"
+                f"Pertanyaan ini kurang lengkap. Identifikasi apa yang kurang "
+                f"lalu buat satu kalimat tanya yang natural dalam Bahasa Indonesia. Singkat dan ramah."
+            )
+        }])
+        return clarify.content.strip()
+
+    # ── Cek PRISMA ──
+    prisma_check = llm.invoke([{
+        "role": "user",
+        "content": (
+            f"Apakah pertanyaan berikut berkaitan dengan data PRISMA TA-ex "
+            f"(reservasi, material TA, PR, PO, work order turnaround, procurement)? "
+            f"Jawab hanya YA atau TIDAK.\n\nPertanyaan: {question}"
+        )
+    }])
+    is_prisma = "YA" in prisma_check.content.strip().upper()
+
+    if is_prisma and PRISMA_URL:
+        SIMPLE_PATTERNS = ["berapa", "total", "jumlah", "rangkuman", "ringkasan", "summary", "status"]
+        COMPLEX_PATTERNS = ["per equipment", "per order", "nilai po", "net price", "harga", "breakdown", "detail"]
+        is_simple  = any(p in _q_lower for p in SIMPLE_PATTERNS)
+        is_complex = any(p in _q_lower for p in COMPLEX_PATTERNS)
+
+        if is_simple and not is_complex:
+            params = {"chatbot_key": CHATBOT_API_KEY}
+            if "belum pr" in _q_lower:   params["status"] = "no-pr"
+            elif "sudah pr" in _q_lower: params["status"] = "pr-created"
+            elif "sudah po" in _q_lower: params["status"] = "po-created"
+            elif "partial"  in _q_lower: params["status"] = "partial"
+            elif "complete" in _q_lower: params["status"] = "complete"
+            if any(k in _q_lower for k in ["rangkuman", "ringkasan", "summary", "total", "berapa"]):
+                params["summary_only"] = "true"
+            try:
+                r = requests.get(f"{PRISMA_URL}/chatbot/tracking", params=params, timeout=30)
+                db_result = f"Hasil PRISMA (jalur sederhana):\n{r.json()}"
+            except Exception as e:
+                db_result = f"Gagal fetch PRISMA: {str(e)}"
+        else:
+            sql_messages = messages + [{"role": "user", "content": (
+                f"Buat query SQL untuk tabel PRISMA TA-ex. "
+                f"Kolom 'order' WAJIB pakai tanda kutip ganda. LIMIT 50. "
+                f"HANYA SQL murni.\n\nPertanyaan: {question}"
+            )}]
+            sql_resp  = llm.invoke(sql_messages)
+            sql_query = sql_resp.content.replace("```sql","").replace("```","").strip()
+            result    = query_prisma(sql_query)
+            if result.get("ok"):
+                db_result = f"Hasil PRISMA ({result.get('rows',0)} baris):\n{result.get('data',[])}"
+            else:
+                db_result = f"Query PRISMA gagal: {result.get('error','Unknown error')}"
+    else:
+        # ── Local DB ──
         sql_messages = messages + [{"role": "user", "content": (
             f"Berikan HANYA query SQL PostgreSQL yang valid untuk: {question}. "
             f"Tanpa penjelasan, tanpa markdown."
         )}]
-        sql_response = llm.invoke(sql_messages)
-        sql_query    = sql_response.content.replace("```sql","").replace("```","").strip()
+        sql_resp  = llm.invoke(sql_messages)
+        sql_query = sql_resp.content.replace("```sql","").replace("```","").strip()
         try:
             db_result = db_engine.run(sql_query)
         except Exception as e:
             db_result = f"Query error: {str(e)}"
 
-    # Generate jawaban final
+    # ── Generate jawaban final ──
     answer_messages = messages + [
         {"role": "user", "content": question},
         {"role": "user", "content": (
-            f"Hasil query SQL:\n{db_result}\n\n"
+            f"Hasil query:\n{db_result}\n\n"
             f"Berikan jawaban final dalam Bahasa Indonesia yang profesional. "
-            f"Format teks bersih untuk mobile app, boleh gunakan emoji."
+            f"Format teks bersih untuk mobile app, boleh gunakan emoji dan poin •."
         )}
     ]
     final  = llm.invoke(answer_messages)
@@ -265,50 +371,18 @@ def run_chat(question: str, user_id: str) -> str:
     add_history(user_id, question, answer)
     return answer
 
-# ─── EXPO PUSH NOTIFICATION ───────────────────────────────────────────────────
-def send_expo_push(token: str, title: str, body: str, data: dict = None):
-    try:
-        payload = {
-            "to":    token,
-            "title": title,
-            "body":  body[:200],   # Expo max body
-            "sound": "default",
-            "data":  data or {},
-        }
-        resp = requests.post(
-            "https://exp.host/--/api/v2/push/send",
-            json=payload,
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=15
-        )
-        result = resp.json()
-        print(f"  [PUSH] {token[:30]}... → {result}")
-        return result
-    except Exception as e:
-        print(f"  [PUSH ERROR] {e}")
-        return {}
-
-def broadcast_push(title: str, body: str, report_id: int, report_type: str):
-    """Kirim push ke semua token terdaftar."""
-    tokens = q("SELECT token FROM push_tokens")
-    for row in tokens:
-        send_expo_push(
-            token=row["token"],
-            title=title,
-            body=body[:100] + "..." if len(body) > 100 else body,
-            data={"report_id": report_id, "type": report_type}
-        )
-        import time; time.sleep(0.1)
+# ─── AUTH ─────────────────────────────────────────────────────────────────────
+def check_auth():
+    if not APP_SECRET_KEY:
+        return True
+    return request.headers.get("Authorization","") == f"Bearer {APP_SECRET_KEY}"
 
 # ─── FLASK APP ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-def check_auth():
-    """Cek APP_SECRET_KEY dari header Authorization."""
-    if not APP_SECRET_KEY:
-        return True   # jika tidak di-set, bypass (dev mode)
-    auth = request.headers.get("Authorization", "")
-    return auth == f"Bearer {APP_SECRET_KEY}"
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "API Server is running 🚀"}), 200
 
 # ── CHATBOT ──────────────────────────────────────────────────────────────────
 @app.route("/chat", methods=["POST"])
@@ -323,10 +397,9 @@ def chat():
     if not user_id or not message:
         return jsonify({"error": "user_id dan message wajib diisi"}), 400
 
-    # Reset history
     if message.lower() in ["/reset", "reset", ".reset"]:
         clear_history(user_id)
-        return jsonify({"reply": "🔄 Percakapan direset. Memori sesi sebelumnya dihapus."}), 200
+        return jsonify({"reply": "🔄 Percakapan direset. Silakan ajukan pertanyaan baru."}), 200
 
     try:
         reply = run_chat(message, user_id)
@@ -341,96 +414,73 @@ def list_reports():
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
 
-    report_type = request.args.get("type")     # filter: daily/weekly/monthly
+    report_type = request.args.get("type")
     limit       = int(request.args.get("limit", 20))
     offset      = int(request.args.get("offset", 0))
 
     if report_type:
         rows = q("""
             SELECT id, type, LEFT(content, 200) AS preview, created_at
-            FROM reports
-            WHERE type = %s
-            ORDER BY created_at DESC
-            LIMIT %s OFFSET %s
+            FROM reports WHERE type = %s
+            ORDER BY created_at DESC LIMIT %s OFFSET %s
         """, (report_type, limit, offset))
     else:
         rows = q("""
             SELECT id, type, LEFT(content, 200) AS preview, created_at
-            FROM reports
-            ORDER BY created_at DESC
-            LIMIT %s OFFSET %s
+            FROM reports ORDER BY created_at DESC LIMIT %s OFFSET %s
         """, (limit, offset))
 
     return jsonify({"reports": rows, "count": len(rows)}), 200
 
-@app.route("/reports/<int:report_id>", methods=["GET"])
-def get_report(report_id):
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-
-    rows = q("SELECT id, type, content, created_at FROM reports WHERE id = %s", (report_id,))
-    if not rows:
-        return jsonify({"error": "Report tidak ditemukan"}), 404
-    return jsonify(rows[0]), 200
-
 @app.route("/reports/latest/<report_type>", methods=["GET"])
 def get_latest_report(report_type):
-    """Ambil report terbaru berdasarkan type."""
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
-
     if report_type not in ("daily", "weekly", "monthly"):
         return jsonify({"error": "type harus daily/weekly/monthly"}), 400
-
     rows = q("""
         SELECT id, type, content, created_at FROM reports
-        WHERE type = %s
-        ORDER BY created_at DESC
-        LIMIT 1
+        WHERE type = %s ORDER BY created_at DESC LIMIT 1
     """, (report_type,))
     if not rows:
         return jsonify({"error": f"Belum ada report {report_type}"}), 404
     return jsonify(rows[0]), 200
 
-# ── PUSH TOKEN REGISTRATION ───────────────────────────────────────────────────
+@app.route("/reports/<int:report_id>", methods=["GET"])
+def get_report(report_id):
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    rows = q("SELECT id, type, content, created_at FROM reports WHERE id = %s", (report_id,))
+    if not rows:
+        return jsonify({"error": "Report tidak ditemukan"}), 404
+    return jsonify(rows[0]), 200
+
+# ── PUSH TOKEN ────────────────────────────────────────────────────────────────
 @app.route("/push/register", methods=["POST"])
 def register_push():
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
-
     body    = request.get_json(force=True, silent=True) or {}
     user_id = body.get("user_id", "").strip()
     token   = body.get("token", "").strip()
-
     if not user_id or not token:
         return jsonify({"error": "user_id dan token wajib diisi"}), 400
-
     execute("""
-        INSERT INTO push_tokens (user_id, token, updated_at)
-        VALUES (%s, %s, NOW())
-        ON CONFLICT (user_id)
-        DO UPDATE SET token = EXCLUDED.token, updated_at = NOW()
+        INSERT INTO push_tokens (user_id, token, updated_at) VALUES (%s, %s, NOW())
+        ON CONFLICT (user_id) DO UPDATE SET token = EXCLUDED.token, updated_at = NOW()
     """, (user_id, token))
-
-    return jsonify({"status": "ok", "message": "Token berhasil didaftarkan"}), 200
+    return jsonify({"status": "ok"}), 200
 
 @app.route("/push/unregister", methods=["POST"])
 def unregister_push():
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
-
     body    = request.get_json(force=True, silent=True) or {}
     user_id = body.get("user_id", "").strip()
     if not user_id:
         return jsonify({"error": "user_id wajib diisi"}), 400
-
     execute("DELETE FROM push_tokens WHERE user_id = %s", (user_id,))
     return jsonify({"status": "ok"}), 200
-
-# ── HEALTH ────────────────────────────────────────────────────────────────────
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "API Server is running 🚀"}), 200
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
