@@ -181,6 +181,7 @@ ATURAN QUERY SQL:
 - Untuk tkdn: kolom refinery_unit, bulan, nominal, kdn, persentase, tahun. Tampilkan dengan format Rp.
 - Untuk rcps: kolom kilang, traffic, judul_rcps, rcps_no, criticallity.
 - Untuk irkap_program: kolom refinery_unit, no_program_kerja, program_kerja, status_step, status_prognosa, nilai_anggaran_idr.
+- Untuk master_data_equipment: master data equipment dari SAP IH08 — berisi semua equipment yang terdaftar di sistem. KOLOM YANG TERSEDIA: criticality (A/B/C/Z), equipment (nomor SAP), functional_location, maintenance_plant, location (kode RU/lokasi), cost_center, wbs_element, main_work_center, planner_group, planning_plant, catalog_profile, equipment_category, description (deskripsi teknis), manufacturer, model_type, serial_number, changed_by, changed_on, created_by, created_on, technical_obj_type, manufact_serial_number, manufacturer_drawing_number, manufacturer_part_number, material, material_description, order_no, size_dimension, sort_field_ata. Contoh query: jumlah equipment per criticality, list equipment berdasarkan functional_location, cari by description atau manufacturer. Filter criticality: WHERE criticality = 'A'.
 
 {prisma_schema}
 
@@ -242,6 +243,7 @@ def run_chat(question: str, user_id: str) -> str:
         "inspection plan", "monitoring operasi", "irkap", "prokja",
         "reservasi", "turnaround", "inspeksi", "realisasi",
         "bandingkan", "program kerja", "anggaran maintenance",
+        "master data", "master data equipment", "equipment master",
     ]
     _SAPAAN_KEYWORDS = [
         "halo", "hai", "hello", "hi ", "selamat pagi", "selamat siang",
