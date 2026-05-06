@@ -485,10 +485,388 @@ def unregister_push():
     return jsonify({"status": "ok"}), 200
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCHEDULER — Daily, Weekly, Monthly (background thread)
+# ═══════════════════════════════════════════════════════════════════════════════
+import schedule, time, json, threading
+from openai import OpenAI
+from datetime import datetime, timezone, timedelta
+from report_helper import save_report
+
+WIB                   = timezone(timedelta(hours=7))
+DAILY_SEND_TIME_UTC   = os.getenv("REPORT_SEND_TIME_UTC",  "23:00")
+WEEKLY_SEND_TIME_UTC  = os.getenv("WEEKLY_SEND_TIME_UTC",  "23:00")
+WEEKLY_SEND_DAY       = os.getenv("WEEKLY_SEND_DAY",       "monday").lower()
+MONTHLY_SEND_TIME_UTC = os.getenv("MONTHLY_SEND_TIME_UTC", "23:00")
+MONTHLY_SEND_DAY      = int(os.getenv("MONTHLY_SEND_DAY",  "1"))
+
+llm_report = OpenAI(api_key=DINOIKI_API_KEY, base_url="https://ai.dinoiki.com/v1")
+
+def ask_llm_report(prompt: str, max_tokens: int = 2000) -> str:
+    resp = llm_report.chat.completions.create(
+        model="gpt-4o", temperature=0.5, max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return resp.choices[0].message.content
+
+# ── DAILY ─────────────────────────────────────────────────────────────────────
+def gather_daily_data():
+    data = {}
+    data["bad_actor"] = q("""
+        SELECT ru, tag_number, status, problem, action_plan, progress, target_date, periode
+        FROM bad_actor_monitoring
+        WHERE periode = (SELECT MAX(periode) FROM bad_actor_monitoring)
+          AND LOWER(COALESCE(status,'')) NOT IN ('closed','complete','selesai','done')
+        ORDER BY ru, tag_number LIMIT 20
+    """)
+    data["icu"] = q("""
+        SELECT ru, tag_no, icu_status, issue, mitigation, progress, target_closed, report_date
+        FROM icu_monitoring
+        WHERE report_date = (SELECT MAX(report_date) FROM icu_monitoring)
+          AND LOWER(COALESCE(icu_status,'')) NOT IN ('closed','resolved','selesai')
+        ORDER BY ru, tag_no LIMIT 20
+    """)
+    data["zero_clamp"] = q("""
+        SELECT ru, area, unit, tag_no_ln, type_damage, tanggal_dipasang, status
+        FROM zero_clamp
+        WHERE tanggal_dilepas IS NULL OR TRIM(COALESCE(tanggal_dilepas,'')) = ''
+        ORDER BY tanggal_dipasang ASC NULLS LAST LIMIT 15
+    """)
+    data["paf"] = q("""
+        SELECT ru, type, target_realisasi, value, color, month_update
+        FROM paf
+        WHERE month_update = (SELECT MAX(month_update) FROM paf)
+          AND LOWER(COALESCE(color,'')) IN ('red','yellow','orange','merah','kuning')
+        ORDER BY ru, type LIMIT 20
+    """)
+    data["power_utility"] = q("""
+        SELECT refinery_unit, type_equipment, equipment, status_operation, remark, date_update
+        FROM power_stream
+        WHERE date_update = (SELECT MAX(date_update) FROM power_stream)
+          AND LOWER(COALESCE(status_operation,'')) NOT IN ('normal','standby','ok','siaga')
+        ORDER BY refinery_unit LIMIT 15
+    """)
+    data["critical_utl"] = q("""
+        SELECT refinery_unit, type_equipment, highlight_issue, corrective_action, target_corrective
+        FROM critical_eqp_utl
+        WHERE month_update = (SELECT MAX(month_update) FROM critical_eqp_utl)
+          AND TRIM(COALESCE(highlight_issue,'')) != ''
+        ORDER BY refinery_unit LIMIT 10
+    """)
+    data["monitoring_operasi"] = q("""
+        SELECT refinery_unit, unit_proses, actual, target_sts, limitasi_alert_process, month_update
+        FROM monitoring_operasi
+        WHERE month_update = (SELECT MAX(month_update) FROM monitoring_operasi)
+          AND (TRIM(COALESCE(limitasi_alert_process,'')) != ''
+            OR (actual IS NOT NULL AND target_sts IS NOT NULL AND actual < target_sts))
+        ORDER BY refinery_unit LIMIT 15
+    """)
+    return data
+
+def run_daily_job():
+    now_wib = datetime.now(WIB)
+    print(f"\n[DAILY] ▶ {now_wib.strftime('%Y-%m-%d %H:%M WIB')}")
+    data     = gather_daily_data()
+    data_str = json.dumps(data, ensure_ascii=False, default=str, indent=2)
+    prompt = f"""Kamu adalah sistem pelaporan otomatis Daily Executive Brief untuk kilang minyak PRISMA.
+Tanggal: {now_wib.strftime('%A, %d %B %Y')} | {now_wib.strftime('%H.%M')} WIB
+DATA: {data_str}
+Buat Daily Executive Brief dalam Bahasa Indonesia profesional. Sebutkan tag number spesifik. Maksimal 3500 karakter.
+FORMAT:
+📌 DAILY EXECUTIVE BRIEF
+🗓️ {now_wib.strftime('%A, %d %B %Y')} | ⏰ {now_wib.strftime('%H.%M')} WIB
+🏭 RINGKASAN EKSEKUTIF
+[2-3 kalimat kondisi umum]
+━━━━━━━━━━
+🔴 PRIORITAS HARI INI
+━━━━━━━━━━
+[3-5 isu kritis dengan tag number]
+━━━━━━━━━━
+📍 STATUS RELIABILITY & OPERASI
+━━━━━━━━━━
+• Operasi: [status] • Reliability: [status] • PAF: [status] • Power/Utility: [status] • ICU/Zero Clamp: [status]
+━━━━━━━━━━
+⚙️ BAD ACTOR WATCHLIST
+━━━━━━━━━━
+[Top 5: Tag | RU | Status | Progress]
+━━━━━━━━━━
+🎯 TINDAK LANJUT HARI INI
+━━━━━━━━━━
+[4-5 action item spesifik]
+Legend: 🟢 Terkendali | 🟡 Watch | 🟠 Action | 🔴 Urgent
+_Auto-generated · Daily Report Agent_"""
+    try:
+        report  = ask_llm_report(prompt, max_tokens=2000)
+        periode = now_wib.strftime("%A, %d %B %Y")
+        save_report("daily", report, periode)
+        print(f"[DAILY] ✅ Done.")
+    except Exception as e:
+        print(f"[DAILY] ❌ {e}")
+
+# ── WEEKLY ────────────────────────────────────────────────────────────────────
+def gather_weekly_data():
+    data = {}
+    data["bad_actor_current"] = q("""
+        SELECT ru, tag_number, status, problem, action_plan, progress, target_date, periode
+        FROM bad_actor_monitoring
+        WHERE periode = (SELECT MAX(periode) FROM bad_actor_monitoring)
+          AND LOWER(COALESCE(status,'')) NOT IN ('closed','complete','selesai','done')
+        ORDER BY ru, tag_number LIMIT 30
+    """)
+    data["bad_actor_prev"] = q("""
+        SELECT tag_number, status, progress FROM bad_actor_monitoring
+        WHERE periode = (SELECT MAX(periode) FROM bad_actor_monitoring
+                         WHERE periode < (SELECT MAX(periode) FROM bad_actor_monitoring))
+        ORDER BY tag_number LIMIT 30
+    """)
+    data["icu_current"] = q("""
+        SELECT ru, tag_no, icu_status, issue, progress, target_closed, report_date
+        FROM icu_monitoring
+        WHERE report_date = (SELECT MAX(report_date) FROM icu_monitoring)
+          AND LOWER(COALESCE(icu_status,'')) NOT IN ('closed','resolved','selesai')
+        ORDER BY ru, tag_no LIMIT 25
+    """)
+    data["paf_current"] = q("""
+        SELECT ru, type, value, color, month_update FROM paf
+        WHERE month_update = (SELECT MAX(month_update) FROM paf)
+          AND LOWER(COALESCE(color,'')) IN ('red','yellow','orange','merah','kuning')
+        ORDER BY ru, type LIMIT 25
+    """)
+    data["paf_prev"] = q("""
+        SELECT ru, type, value, color, month_update FROM paf
+        WHERE month_update = (SELECT MAX(month_update) FROM paf
+                              WHERE month_update < (SELECT MAX(month_update) FROM paf))
+        ORDER BY ru, type LIMIT 25
+    """)
+    data["power_utility"] = q("""
+        SELECT refinery_unit, type_equipment, equipment, status_operation, remark, date_update
+        FROM power_stream
+        WHERE date_update = (SELECT MAX(date_update) FROM power_stream)
+          AND LOWER(COALESCE(status_operation,'')) NOT IN ('normal','standby','ok','siaga')
+        ORDER BY refinery_unit LIMIT 20
+    """)
+    data["critical_utl"] = q("""
+        SELECT refinery_unit, type_equipment, highlight_issue, corrective_action
+        FROM critical_eqp_utl
+        WHERE month_update = (SELECT MAX(month_update) FROM critical_eqp_utl)
+          AND TRIM(COALESCE(highlight_issue,'')) != ''
+        ORDER BY refinery_unit LIMIT 15
+    """)
+    data["readiness_jetty"] = q("""
+        SELECT refinery_unit, tag_no, status_operation, status_tuks, status_ijin_ops, month_update
+        FROM readiness_jetty
+        WHERE month_update = (SELECT MAX(month_update) FROM readiness_jetty)
+          AND (LOWER(COALESCE(status_operation,'')) NOT IN ('normal','siap','ok','ready')
+            OR LOWER(COALESCE(status_tuks,'')) NOT IN ('valid','ok','aktif'))
+        ORDER BY refinery_unit, tag_no LIMIT 15
+    """)
+    data["readiness_tank"] = q("""
+        SELECT refinery_unit, tag_number, status_operational, status_coi, status_atg, month_update
+        FROM readiness_tank
+        WHERE month_update = (SELECT MAX(month_update) FROM readiness_tank)
+          AND LOWER(COALESCE(status_operational,'')) NOT IN ('normal','ok','siap')
+        ORDER BY refinery_unit, tag_number LIMIT 15
+    """)
+    data["readiness_spm"] = q("""
+        SELECT refinery_unit, tag_no, status_operation, status_laik_operasi, month_update
+        FROM readiness_spm
+        WHERE month_update = (SELECT MAX(month_update) FROM readiness_spm)
+          AND LOWER(COALESCE(status_operation,'')) NOT IN ('normal','siap','ok','ready')
+        ORDER BY refinery_unit, tag_no LIMIT 15
+    """)
+    data["atg"] = q("""
+        SELECT refinery_unit, tag_no_tangki, tag_no_atg, status_atg, status_interkoneksi_atg, month_update
+        FROM atg_monitoring
+        WHERE month_update = (SELECT MAX(month_update) FROM atg_monitoring)
+          AND (LOWER(COALESCE(status_atg,'')) NOT IN ('ok','normal','aktif')
+            OR LOWER(COALESCE(status_interkoneksi_atg,'')) NOT IN ('aktif','active','ok'))
+        ORDER BY refinery_unit LIMIT 20
+    """)
+    return data
+
+def run_weekly_job():
+    now_wib = datetime.now(WIB)
+    print(f"\n[WEEKLY] ▶ {now_wib.strftime('%Y-%m-%d %H:%M WIB')}")
+    data      = gather_weekly_data()
+    curr_tags = {r["tag_number"] for r in data.get("bad_actor_current", [])}
+    prev_tags = {r["tag_number"] for r in data.get("bad_actor_prev", [])}
+    trend     = {"recurring": sorted(curr_tags & prev_tags), "new": sorted(curr_tags - prev_tags)}
+    data_str  = json.dumps(data, ensure_ascii=False, default=str, indent=2)
+    tgl       = now_wib.strftime("%A, %d %B %Y | %H.%M")
+    prompt = f"""Kamu adalah sistem pelaporan Weekly Executive Review untuk kilang minyak PRISMA.
+Laporan dibuat: {tgl} WIB
+TREND BAD ACTOR: {json.dumps(trend, ensure_ascii=False)}
+DATA: {data_str}
+Buat Weekly Executive Review dalam Bahasa Indonesia formal. Sebutkan tag number spesifik. Maksimal 4000 karakter.
+FORMAT:
+*📘 WEEKLY EXECUTIVE REVIEW*
+*🗓️ Periode: [dari data]* | *⏰ {tgl} WIB*
+*🏭 Ringkasan Eksekutif Mingguan* [3 kalimat kondisi umum]
+━━━━━━━━━━
+*🔴 1. ISU PRIORITAS MINGGU INI* [3-4 isu dengan tag number]
+━━━━━━━━━━
+*⚙️ 2. WEEKLY BAD ACTOR REVIEW* [Top 5: TAG | RU | status | trend]
+━━━━━━━━━━
+*🚢 3. WEEKLY READINESS REVIEW* • Jetty: [status] • Tank: [status] • SPM: [status] • ATG: [status]
+━━━━━━━━━━
+*🎯 4. TINDAK LANJUT MINGGU DEPAN* [4 action item spesifik]
+Legend: 🟢 Terkendali | 🟡 Watch | 🟠 Action | 🔴 Urgent
+_Auto-generated · Weekly Report Agent_"""
+    try:
+        report  = ask_llm_report(prompt, max_tokens=2500)
+        periode = now_wib.strftime("Minggu %d %B %Y")
+        save_report("weekly", report, periode)
+        print(f"[WEEKLY] ✅ Done.")
+    except Exception as e:
+        print(f"[WEEKLY] ❌ {e}")
+
+# ── MONTHLY ───────────────────────────────────────────────────────────────────
+def gather_monthly_data():
+    data = {}
+    data["bad_actor_current"] = q("""
+        SELECT ru, tag_number, status, problem, action_plan, progress, target_date, periode
+        FROM bad_actor_monitoring
+        WHERE periode = (SELECT MAX(periode) FROM bad_actor_monitoring)
+          AND LOWER(COALESCE(status,'')) NOT IN ('closed','complete','selesai','done')
+        ORDER BY ru, tag_number LIMIT 30
+    """)
+    data["bad_actor_prev"] = q("""
+        SELECT tag_number, status, progress FROM bad_actor_monitoring
+        WHERE periode = (SELECT MAX(periode) FROM bad_actor_monitoring
+                         WHERE periode < (SELECT MAX(periode) FROM bad_actor_monitoring))
+        ORDER BY tag_number LIMIT 30
+    """)
+    data["icu_current"] = q("""
+        SELECT ru, tag_no, icu_status, issue, progress, report_date FROM icu_monitoring
+        WHERE report_date = (SELECT MAX(report_date) FROM icu_monitoring)
+          AND LOWER(COALESCE(icu_status,'')) NOT IN ('closed','resolved','selesai')
+        LIMIT 25
+    """)
+    data["paf_current"] = q("""
+        SELECT ru, type, value, color, month_update FROM paf
+        WHERE month_update = (SELECT MAX(month_update) FROM paf)
+          AND LOWER(COALESCE(color,'')) IN ('red','yellow','orange','merah','kuning')
+        ORDER BY ru, type LIMIT 25
+    """)
+    data["paf_prev"] = q("""
+        SELECT ru, type, value, color, month_update FROM paf
+        WHERE month_update = (SELECT MAX(month_update) FROM paf
+                              WHERE month_update < (SELECT MAX(month_update) FROM paf))
+        ORDER BY ru, type LIMIT 25
+    """)
+    data["readiness_jetty"] = q("""
+        SELECT refinery_unit, tag_no, status_operation, status_tuks, month_update
+        FROM readiness_jetty
+        WHERE month_update = (SELECT MAX(month_update) FROM readiness_jetty)
+          AND LOWER(COALESCE(status_operation,'')) NOT IN ('normal','siap','ok','ready')
+        ORDER BY refinery_unit, tag_no LIMIT 15
+    """)
+    data["readiness_tank"] = q("""
+        SELECT refinery_unit, tag_number, status_operational, status_coi, month_update
+        FROM readiness_tank
+        WHERE month_update = (SELECT MAX(month_update) FROM readiness_tank)
+          AND LOWER(COALESCE(status_operational,'')) NOT IN ('normal','ok','siap')
+        ORDER BY refinery_unit, tag_number LIMIT 15
+    """)
+    data["readiness_spm"] = q("""
+        SELECT refinery_unit, tag_no, status_operation, status_laik_operasi, month_update
+        FROM readiness_spm
+        WHERE month_update = (SELECT MAX(month_update) FROM readiness_spm)
+          AND LOWER(COALESCE(status_operation,'')) NOT IN ('normal','siap','ok','ready')
+        ORDER BY refinery_unit, tag_no LIMIT 15
+    """)
+    data["atg"] = q("""
+        SELECT refinery_unit, tag_no_tangki, tag_no_atg, status_atg, status_interkoneksi_atg, month_update
+        FROM atg_monitoring
+        WHERE month_update = (SELECT MAX(month_update) FROM atg_monitoring)
+          AND (LOWER(COALESCE(status_atg,'')) NOT IN ('ok','normal','aktif')
+            OR LOWER(COALESCE(status_interkoneksi_atg,'')) NOT IN ('aktif','active','ok'))
+        ORDER BY refinery_unit LIMIT 20
+    """)
+    return data
+
+def run_monthly_job():
+    now_wib = datetime.now(WIB)
+    print(f"\n[MONTHLY] ▶ {now_wib.strftime('%Y-%m-%d %H:%M WIB')}")
+    data     = gather_monthly_data()
+    data_str = json.dumps(data, ensure_ascii=False, default=str, indent=2)
+    tgl      = now_wib.strftime("%A, %d %B %Y | %H.%M")
+    prompt = f"""Kamu adalah sistem pelaporan Monthly Management Review untuk kilang minyak PRISMA.
+Laporan dibuat: {tgl} WIB
+DATA: {data_str}
+Buat Monthly Management Review dalam Bahasa Indonesia formal. Sebutkan tag number spesifik. Maksimal 5000 karakter.
+FORMAT:
+📙 MONTHLY MANAGEMENT REVIEW
+🗓️ Periode: [dari data] | ⏰ Disusun: {tgl} WIB
+🏭 Ringkasan Eksekutif Bulanan [3-4 kalimat kondisi umum]
+━━━━━━━━━━
+🔴 1. MANAGEMENT HEADLINE BULAN INI [3 headline utama]
+━━━━━━━━━━
+📍 2. MONTHLY PERFORMANCE SUMMARY
+• Operasi: [status] • Reliability: [status] • PAF: [status] • Readiness: [status]
+━━━━━━━━━━
+🔥 3. TOP BAD ACTOR BULAN INI [Top 5: TAG | RU | status | trend]
+━━━━━━━━━━
+🚢 4. MONTHLY READINESS REVIEW
+• Jetty: [status] • Tank: [status] • SPM: [status] • ATG: [status]
+━━━━━━━━━━
+🎯 5. MANAGEMENT FOCUS BULAN DEPAN [4 action item spesifik]
+Legend: 🟢 Terkendali | 🟡 Watch | 🟠 Action | 🔴 Urgent
+_Auto-generated · Monthly Management Review Agent_"""
+    try:
+        report  = ask_llm_report(prompt, max_tokens=3000)
+        periode = now_wib.strftime("%B %Y")
+        save_report("monthly", report, periode)
+        print(f"[MONTHLY] ✅ Done.")
+    except Exception as e:
+        print(f"[MONTHLY] ❌ {e}")
+
+# ── SCHEDULER SETUP ───────────────────────────────────────────────────────────
+def setup_scheduler():
+    # Daily
+    schedule.every().day.at(DAILY_SEND_TIME_UTC).do(run_daily_job)
+    print(f"[SCHEDULER] Daily  : setiap hari {DAILY_SEND_TIME_UTC} UTC = 06:00 WIB")
+
+    # Weekly
+    day_map = {
+        "monday": schedule.every().monday, "tuesday": schedule.every().tuesday,
+        "wednesday": schedule.every().wednesday, "thursday": schedule.every().thursday,
+        "friday": schedule.every().friday, "saturday": schedule.every().saturday,
+        "sunday": schedule.every().sunday,
+    }
+    day_map.get(WEEKLY_SEND_DAY, schedule.every().monday).at(WEEKLY_SEND_TIME_UTC).do(run_weekly_job)
+    print(f"[SCHEDULER] Weekly : setiap {WEEKLY_SEND_DAY} {WEEKLY_SEND_TIME_UTC} UTC = 06:00 WIB")
+
+    # Monthly
+    def monthly_wrapper():
+        if datetime.now(timezone.utc).day == MONTHLY_SEND_DAY:
+            run_monthly_job()
+    schedule.every().day.at(MONTHLY_SEND_TIME_UTC).do(monthly_wrapper)
+    print(f"[SCHEDULER] Monthly: setiap tgl {MONTHLY_SEND_DAY} {MONTHLY_SEND_TIME_UTC} UTC = 06:00 WIB")
+
+def run_scheduler():
+    setup_scheduler()
+    run_now = os.getenv("RUN_NOW", "").lower()
+    if run_now in ("1", "true", "yes", "daily"):
+        print("\n[RUN_NOW] Daily..."); run_daily_job()
+    if run_now == "weekly":
+        print("\n[RUN_NOW] Weekly..."); run_weekly_job()
+    if run_now == "monthly":
+        print("\n[RUN_NOW] Monthly..."); run_monthly_job()
+    if run_now == "all":
+        run_daily_job(); run_weekly_job(); run_monthly_job()
+    print("\n[SCHEDULER] ⏳ Menunggu jadwal...\n")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     init_tables()
     port = int(os.getenv("PORT", 5000))
     print(f"🚀 API Server berjalan di port {port}...")
+
+    t = threading.Thread(target=run_scheduler, daemon=True)
+    t.start()
 
     app.run(host="0.0.0.0", port=port, threaded=True)
