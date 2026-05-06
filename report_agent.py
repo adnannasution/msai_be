@@ -104,7 +104,7 @@ def gather_data():
         SELECT ru, type, target_realisasi, value, plan_unplan,
                month_update, color
         FROM paf
-        WHERE code_current = 1
+        WHERE month_update = (SELECT MAX(month_update) FROM paf)
           AND LOWER(COALESCE(color,'')) IN ('red','yellow','orange','merah','kuning')
         ORDER BY ru, type
         LIMIT 20
@@ -113,7 +113,7 @@ def gather_data():
     data["issue_paf"] = q("""
         SELECT ru, type, date, issue, month_update
         FROM issue_paf
-        WHERE code_current = 1
+        WHERE month_update = (SELECT MAX(month_update) FROM issue_paf)
         ORDER BY date DESC NULLS LAST
         LIMIT 15
     """)
@@ -123,7 +123,7 @@ def gather_data():
                status_operation, status_n0, average_actual,
                desain, kapasitas_max, remark, date_update
         FROM power_stream
-        WHERE code_current = 1
+        WHERE date_update = (SELECT MAX(date_update) FROM power_stream)
           AND LOWER(COALESCE(status_operation,'')) NOT IN ('normal','standby','ok','siaga')
         ORDER BY refinery_unit, type_equipment
         LIMIT 15
@@ -134,7 +134,7 @@ def gather_data():
                corrective_action, target_corrective, traffic_corrective,
                mitigasi_action, target_mitigasi, traffic_mitigasi
         FROM critical_eqp_utl
-        WHERE code_current = 1
+        WHERE month_update = (SELECT MAX(month_update) FROM critical_eqp_utl)
           AND TRIM(COALESCE(highlight_issue,'')) != ''
         ORDER BY refinery_unit
         LIMIT 10
@@ -235,7 +235,7 @@ def gather_data():
                plant_readiness, limitasi_alert_process, mitigasi_process,
                limitasi_alert_sts, mitigasi_sts, month_update
         FROM monitoring_operasi
-        WHERE code_current = 1
+        WHERE month_update = (SELECT MAX(month_update) FROM monitoring_operasi)
           AND (
             TRIM(COALESCE(limitasi_alert_process,'')) != ''
             OR (actual IS NOT NULL AND target_sts IS NOT NULL AND actual < target_sts)

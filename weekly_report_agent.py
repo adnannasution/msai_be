@@ -137,13 +137,13 @@ def gather_weekly_data():
     """)
 
     # 5. PAF
-    # current  → code_current = 1
-    # prev     → code_current = 0 dengan month_update terbaru (untuk trend)
+    # current  → month_update terbaru
+    # prev     → month_update terbaru sebelumnya (untuk trend)
     data["paf_current"] = q("""
         SELECT ru, type, target_realisasi, value, plan_unplan,
                month_update, color
         FROM paf
-        WHERE code_current = 1
+        WHERE month_update = (SELECT MAX(month_update) FROM paf)
           AND LOWER(COALESCE(color,'')) IN ('red','yellow','orange','merah','kuning')
         ORDER BY ru, type
         LIMIT 25
@@ -152,40 +152,42 @@ def gather_weekly_data():
     data["paf_prev"] = q("""
         SELECT ru, type, value, color, month_update
         FROM paf
-        WHERE code_current = 0
-          AND month_update = (SELECT MAX(month_update) FROM paf WHERE code_current = 0)
+        WHERE month_update = (
+            SELECT MAX(month_update) FROM paf
+            WHERE month_update < (SELECT MAX(month_update) FROM paf)
+        )
         ORDER BY ru, type
         LIMIT 25
     """)
 
-    # 6. ISSUE PAF — code_current = 1
+    # 6. ISSUE PAF — month_update terbaru
     data["issue_paf"] = q("""
         SELECT ru, type, date, issue, month_update
         FROM issue_paf
-        WHERE code_current = 1
+        WHERE month_update = (SELECT MAX(month_update) FROM issue_paf)
         ORDER BY date DESC NULLS LAST
         LIMIT 20
     """)
 
-    # 7. POWER & UTILITY — code_current = 1, status tidak normal
+    # 7. POWER & UTILITY — month_update terbaru, status tidak normal
     data["power_utility"] = q("""
         SELECT refinery_unit, type_equipment, equipment,
                status_operation, status_n0, average_actual,
                desain, kapasitas_max, remark, date_update
         FROM power_stream
-        WHERE code_current = 1
+        WHERE date_update = (SELECT MAX(date_update) FROM power_stream)
           AND LOWER(COALESCE(status_operation,'')) NOT IN ('normal','standby','ok','siaga')
         ORDER BY refinery_unit, type_equipment
         LIMIT 20
     """)
 
-    # 8. CRITICAL EQUIPMENT UTL — code_current = 1
+    # 8. CRITICAL EQUIPMENT UTL — month_update terbaru
     data["critical_utl"] = q("""
         SELECT refinery_unit, type_equipment, highlight_issue,
                corrective_action, target_corrective, traffic_corrective,
                mitigasi_action, target_mitigasi, traffic_mitigasi
         FROM critical_eqp_utl
-        WHERE code_current = 1
+        WHERE month_update = (SELECT MAX(month_update) FROM critical_eqp_utl)
           AND TRIM(COALESCE(highlight_issue,'')) != ''
         ORDER BY refinery_unit
         LIMIT 15
@@ -287,13 +289,13 @@ def gather_weekly_data():
         LIMIT 20
     """)
 
-    # 15. MONITORING OPERASI — code_current = 1, ada limitasi/deviasi
+    # 15. MONITORING OPERASI — month_update terbaru, ada limitasi/deviasi
     data["monitoring_operasi"] = q("""
         SELECT refinery_unit, unit_proses, unit, actual, target_sts,
                plant_readiness, limitasi_alert_process, mitigasi_process,
                limitasi_alert_sts, mitigasi_sts, month_update
         FROM monitoring_operasi
-        WHERE code_current = 1
+        WHERE month_update = (SELECT MAX(month_update) FROM monitoring_operasi)
           AND (
             TRIM(COALESCE(limitasi_alert_process,'')) != ''
             OR (actual IS NOT NULL AND target_sts IS NOT NULL AND actual < target_sts)
