@@ -3,22 +3,19 @@ Daily Executive Brief Agent
 - Standalone Railway service (worker)
 - Query langsung ke PostgreSQL
 - Generate report via Dinoiki (OpenAI-compatible endpoint)
-- Kirim WhatsApp via Fonnte jam 06.00 WIB
-- Simpan ke DB + kirim Expo push notif via report_helper
+- Simpan ke DB + kirim Expo push notif ke React Native app
 """
 
-import os, time, json, requests, psycopg2, psycopg2.extras, schedule
+import os, time, json, psycopg2, psycopg2.extras, schedule
 from openai import OpenAI
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from report_helper import save_and_notify
+from report_helper import save_report
 
 load_dotenv()
 
 DATABASE_URL   = os.getenv("DATABASE_URL", "")
-FONNTE_TOKEN   = os.getenv("FONNTE_TOKEN", "")
 DINOIKI_API_KEY= os.getenv("DINOIKI_API_KEY", "")
-WA_TARGETS     = os.getenv("REPORT_WA_TARGETS", "")
 SEND_TIME_UTC  = os.getenv("REPORT_SEND_TIME_UTC", "23:00")
 WIB            = timezone(timedelta(hours=7))
 
@@ -314,22 +311,6 @@ _Auto-generated · Daily Report Agent_"""
     return ask_llm(prompt)
 
 
-# ─── WHATSAPP ─────────────────────────────────────────────────────────────────
-def send_wa(target: str, message: str) -> bool:
-    try:
-        resp = requests.post(
-            "https://api.fonnte.com/send",
-            headers={"Authorization": FONNTE_TOKEN},
-            data={"target": target, "message": message},
-            timeout=30
-        )
-        result = resp.json()
-        ok = result.get("status", False)
-        print(f"  [WA] {'✅' if ok else '❌'} {target} — {result}")
-        return ok
-    except Exception as e:
-        print(f"  [WA] ❌ {target} — {e}")
-        return False
 
 
 # ─── JOB ──────────────────────────────────────────────────────────────────────
@@ -352,19 +333,10 @@ def run_report_job():
         print(f"  ❌ {e}")
         return
 
-    # Simpan ke DB + kirim Expo push notif
-    save_and_notify("daily", report)
-
-    # Kirim WA (opsional — bisa dikosongkan kalau hanya pakai app)
-    targets = [t.strip() for t in WA_TARGETS.split(",") if t.strip()]
-    if targets:
-        print(f"[3/3] 📤 Kirim WA ke {len(targets)} nomor...")
-        for t in targets:
-            send_wa(t, report)
-            time.sleep(2)
-    else:
-        print("[3/3] ℹ️  REPORT_WA_TARGETS kosong — skip WA, hanya push notif app.")
-
+    # Simpan ke DB + kirim Expo push notif ke semua device
+    periode = now_wib.strftime("%A, %d %B %Y")
+    save_report("daily", report, periode)
+    print(f"  ✅ Report disimpan ke DB & push notif terkirim (periode: {periode})")
     print("[DAILY] ✅ Done.\n")
 
 
@@ -375,9 +347,7 @@ def main():
     print("=" * 50)
     print(f"  Jadwal  : {SEND_TIME_UTC} UTC  =  06.00 WIB")
     print(f"  DB      : {'✅' if DATABASE_URL else '❌ Missing'}")
-    print(f"  Fonnte  : {'✅' if FONNTE_TOKEN else '❌ Missing'}")
     print(f"  Dinoiki : {'✅' if DINOIKI_API_KEY else '❌ Missing'}")
-    print(f"  WA      : {WA_TARGETS or 'tidak diset (hanya app)'}")
     print("=" * 50)
 
     if os.getenv("RUN_NOW", "").lower() in ("1", "true", "yes"):

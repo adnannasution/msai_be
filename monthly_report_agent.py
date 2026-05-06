@@ -3,7 +3,7 @@ Monthly Management Review Agent
 - Standalone Railway service (worker)
 - Query langsung ke PostgreSQL (Railway) — tabel sama dengan daily & weekly
 - Generate report via Dinoiki (OpenAI-compatible endpoint)
-- Kirim WhatsApp via Fonnte setiap tanggal 1 jam 06.00 WIB (default)
+- Simpan ke DB + kirim Expo push notif ke React Native app
 - Format: MONTHLY MANAGEMENT REVIEW — 9 seksi
 
 Strategi ambil data:
@@ -11,17 +11,16 @@ Strategi ambil data:
   Untuk trend  → ambil 2 snapshot terbaru (current vs bulan sebelumnya).
 """
 
-import os, time, json, requests, psycopg2, psycopg2.extras, schedule
+import os, time, json, psycopg2, psycopg2.extras, schedule
 from openai import OpenAI
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+from report_helper import save_report
 
 load_dotenv()
 
 DATABASE_URL          = os.getenv("DATABASE_URL", "")
-FONNTE_TOKEN          = os.getenv("FONNTE_TOKEN", "")
 DINOIKI_API_KEY       = os.getenv("DINOIKI_API_KEY", "")
-WA_TARGETS            = os.getenv("MONTHLY_WA_TARGETS", os.getenv("REPORT_WA_TARGETS", ""))
 MONTHLY_SEND_TIME_UTC = os.getenv("MONTHLY_SEND_TIME_UTC", "23:00")  # 23:00 UTC = 06:00 WIB
 MONTHLY_SEND_DAY      = int(os.getenv("MONTHLY_SEND_DAY", "1"))       # tanggal berapa tiap bulan
 WIB                   = timezone(timedelta(hours=7))
@@ -632,22 +631,6 @@ _Auto-generated · Monthly Management Review Agent_"""
     return ask_llm(prompt)
 
 
-# ─── WHATSAPP ─────────────────────────────────────────────────────────────────
-def send_wa(target: str, message: str) -> bool:
-    try:
-        resp = requests.post(
-            "https://api.fonnte.com/send",
-            headers={"Authorization": FONNTE_TOKEN},
-            data={"target": target, "message": message},
-            timeout=30
-        )
-        result = resp.json()
-        ok = result.get("status", False)
-        print(f"  [WA] {'✅' if ok else '❌'} {target} — {result}")
-        return ok
-    except Exception as e:
-        print(f"  [WA] ❌ {target} — {e}")
-        return False
 
 
 # ─── JOB ──────────────────────────────────────────────────────────────────────
@@ -671,16 +654,10 @@ def run_monthly_job():
         print(f"  ❌ LLM error: {e}")
         return
 
-    targets = [t.strip() for t in WA_TARGETS.split(",") if t.strip()]
-    if not targets:
-        print("[3/3] ⚠️  Tidak ada target WA — preview:\n")
-        print(report)
-        return
-
-    print(f"[3/3] 📤 Kirim ke {len(targets)} nomor...")
-    for t in targets:
-        send_wa(t, report)
-        time.sleep(2)
+    # Simpan ke DB + kirim Expo push notif ke semua device
+    periode = now_wib.strftime("%B %Y")
+    save_report("monthly", report, periode)
+    print(f"  ✅ Report disimpan ke DB & push notif terkirim (periode: {periode})")
     print("[MONTHLY] ✅ Done.\n")
 
 
@@ -707,9 +684,7 @@ def main():
     print("  Monthly Management Review Agent")
     print("=" * 55)
     print(f"  DB       : {'✅' if DATABASE_URL else '❌ Missing'}")
-    print(f"  Fonnte   : {'✅' if FONNTE_TOKEN else '❌ Missing'}")
     print(f"  Dinoiki  : {'✅' if DINOIKI_API_KEY else '❌ Missing'}")
-    print(f"  Target WA: {WA_TARGETS or '❌ Missing'}")
     _schedule_monthly()
     print("=" * 55)
 

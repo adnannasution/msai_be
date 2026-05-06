@@ -3,7 +3,7 @@ Weekly Executive Review Agent
 - Standalone Railway service (worker)
 - Query langsung ke PostgreSQL (Railway)
 - Generate report via Dinoiki (OpenAI-compatible endpoint)
-- Kirim WhatsApp via Fonnte setiap Senin jam 06.00 WIB (default)
+- Simpan ke DB + kirim Expo push notif ke React Native app
 - Format: WEEKLY EXECUTIVE REVIEW — 8 seksi (format WhatsApp bold)
 
 Strategi ambil data:
@@ -11,19 +11,18 @@ Strategi ambil data:
   Untuk trend → ambil 2 snapshot terbaru (current vs sebelumnya).
 """
 
-import os, time, json, requests, psycopg2, psycopg2.extras, schedule
+import os, time, json, psycopg2, psycopg2.extras, schedule
 from openai import OpenAI
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+from report_helper import save_report
 
 load_dotenv()
 
 DATABASE_URL         = os.getenv("DATABASE_URL", "")
-FONNTE_TOKEN         = os.getenv("FONNTE_TOKEN", "")
 DINOIKI_API_KEY      = os.getenv("DINOIKI_API_KEY", "")
-WA_TARGETS           = os.getenv("WEEKLY_WA_TARGETS", os.getenv("REPORT_WA_TARGETS", ""))
 WEEKLY_SEND_TIME_UTC = os.getenv("WEEKLY_SEND_TIME_UTC", "23:00")   # 23:00 UTC = 06:00 WIB
-WEEKLY_SEND_DAY      = os.getenv("WEEKLY_SEND_DAY", "sunday").lower()
+WEEKLY_SEND_DAY      = os.getenv("WEEKLY_SEND_DAY", "monday").lower()  # default Senin 06:00 WIB
 WIB                  = timezone(timedelta(hours=7))
 
 # ─── LLM ─────────────────────────────────────────────────────────────────────
@@ -510,22 +509,6 @@ _Auto-generated · PRISMA Weekly Report Agent_"""
     return ask_llm(prompt)
 
 
-# ─── WHATSAPP ─────────────────────────────────────────────────────────────────
-def send_wa(target: str, message: str) -> bool:
-    try:
-        resp = requests.post(
-            "https://api.fonnte.com/send",
-            headers={"Authorization": FONNTE_TOKEN},
-            data={"target": target, "message": message},
-            timeout=30
-        )
-        result = resp.json()
-        ok = result.get("status", False)
-        print(f"  [WA] {'✅' if ok else '❌'} {target} — {result}")
-        return ok
-    except Exception as e:
-        print(f"  [WA] ❌ {target} — {e}")
-        return False
 
 
 # ─── JOB ──────────────────────────────────────────────────────────────────────
@@ -549,16 +532,11 @@ def run_weekly_job():
         print(f"  ❌ LLM error: {e}")
         return
 
-    targets = [t.strip() for t in WA_TARGETS.split(",") if t.strip()]
-    if not targets:
-        print("[3/3] ⚠️  Tidak ada target WA — preview:\n")
-        print(report)
-        return
+    # Simpan ke DB + kirim Expo push notif ke semua device
+    periode = now_wib.strftime("Minggu %d %B %Y")
+    save_report("weekly", report, periode)
+    print(f"  ✅ Report disimpan ke DB & push notif terkirim (periode: {periode})")
 
-    print(f"[3/3] 📤 Kirim ke {len(targets)} nomor...")
-    for t in targets:
-        send_wa(t, report)
-        time.sleep(2)
     print("[WEEKLY] ✅ Done.\n")
 
 
@@ -584,9 +562,7 @@ def main():
     print("  PRISMA Weekly Executive Review Agent")
     print("=" * 55)
     print(f"  DB       : {'✅' if DATABASE_URL else '❌ Missing'}")
-    print(f"  Fonnte   : {'✅' if FONNTE_TOKEN else '❌ Missing'}")
     print(f"  Dinoiki  : {'✅' if DINOIKI_API_KEY else '❌ Missing'}")
-    print(f"  Target WA: {WA_TARGETS or '❌ Missing'}")
     _schedule_weekly()
     print("=" * 55)
 
